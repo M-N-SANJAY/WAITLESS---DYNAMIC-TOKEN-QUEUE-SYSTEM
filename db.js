@@ -39,6 +39,7 @@ const TokenSchema = new mongoose.Schema({
   endedAt: Date,
   counterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Counter', index: true },
   staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  blocked: { type: Boolean, default: false },
 });
 
 const ServiceEventSchema = new mongoose.Schema({

@@ -11,7 +11,6 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 SERVICE_TYPES = ["general", "billing", "consultation"]
 
-# log-normal base durations (minutes)
 BASE = {
     "general":      {"mean": 4.0,  "sigma": 0.55},
     "billing":      {"mean": 6.5,  "sigma": 0.45},
@@ -77,13 +76,18 @@ app = FastAPI()
 
 class QueueItem(BaseModel):
     serviceType: str
-    state: str            # 'waiting' or 'serving'
+    state: str
     elapsedMs: float = 0
 
 class PredictRequest(BaseModel):
     hour: int
     dayOfWeek: int
     ahead: list[QueueItem]
+
+class DurationStatsRequest(BaseModel):
+    serviceTypes: list[str]
+    hour: int
+    dayOfWeek: int
 
 @app.on_event("startup")
 def _startup():
@@ -98,8 +102,26 @@ def retrain():
     train_all()
     return {"ok": True}
 
+@app.post("/duration_stats")
+def duration_stats(req: DurationStatsRequest):
+    """Return p10/p50/p90 (minutes) for each requested service type at given time."""
+    out = {}
+    for st in req.serviceTypes:
+        if st not in SERVICE_TYPES:
+            # fallback
+            out[st] = {"p10": 4.0, "p50": 5.0, "p90": 7.0}
+            continue
+        row = pd.DataFrame([{"serviceType": st, "hour": req.hour, "dayOfWeek": req.dayOfWeek}])
+        X = featurize(row)
+        p10 = float(MODELS["p10"].predict(X)[0])
+        p50 = float(MODELS["p50"].predict(X)[0])
+        p90 = float(MODELS["p90"].predict(X)[0])
+        out[st] = {"p10": p10, "p50": p50, "p90": p90}
+    return out
+
 @app.post("/predict")
 def predict(req: PredictRequest):
+    """Legacy single-queue prediction (kept for compatibility)."""
     if not req.ahead:
         return {"etaMinutes": 0.0, "p10Minutes": 0.0, "p90Minutes": 0.0}
 
@@ -115,7 +137,6 @@ def predict(req: PredictRequest):
         p10 = float(MODELS["p10"].predict(X)[0])
         p50 = float(MODELS["p50"].predict(X)[0])
         p90 = float(MODELS["p90"].predict(X)[0])
-        # convert 10–90 spread into a normal sigma (1.2816 = z_0.90)
         sigma = max(0.5, (p90 - p10) / (2 * 1.2816))
         samples = np.random.normal(p50, sigma, n_sims).clip(0.2, None)
         if item.state == "serving":

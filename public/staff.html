@@ -22,12 +22,17 @@
     </div>
   </div>
 
-  <div class="card" id="pauseCard" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
-    <div id="pauseStatus" style="color:var(--muted)">🟢 Available</div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <button class="btn warn small" id="pauseBtn">Take 10-min break</button>
-      <button class="btn good small" id="resumeBtn" hidden>Resume</button>
+  <div class="card" id="pauseCard">
+    <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+      <div id="pauseStatus" style="color:var(--muted)">🟢 Available</div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn warn small" id="pauseBtn">Take a break</button>
+        <button class="btn good small" id="resumeBtn" hidden>Resume</button>
+      </div>
     </div>
+    <div id="pauseFeedback" hidden style="margin-top:12px;padding:10px;border-radius:8px;
+         background:rgba(91,140,255,.08);border:1px solid rgba(91,140,255,.25);
+         color:var(--muted);font-size:13px"></div>
   </div>
 
   <div class="card"><h2>Now serving</h2><div id="serving"></div></div>
@@ -52,11 +57,22 @@
     const minutes = prompt('How many minutes? (default 10)', '10');
     if (minutes === null) return;
     const reason = prompt('Reason? (optional)', 'Break') || 'Break';
-    await fetch('/api/pause', {
+    const r = await fetch('/api/pause', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ minutes: parseInt(minutes) || 10, reason }),
     });
+    if (r.ok) {
+      const data = await r.json();
+      const fb = document.getElementById('pauseFeedback');
+      fb.hidden = false;
+      let msg = `⏸ Paused until ${new Date(data.until).toLocaleTimeString()}. `;
+      if (data.reassigned > 0) msg += `${data.reassigned} waiting token${data.reassigned > 1 ? 's' : ''} reassigned to other counters. `;
+      if (data.blocked > 0)    msg += `${data.blocked} token${data.blocked > 1 ? 's' : ''} couldn't be reassigned (no alternate staff available).`;
+      if (data.reassigned === 0 && data.blocked === 0) msg += 'No waiting tokens to reassign.';
+      fb.textContent = msg;
+      setTimeout(() => { fb.hidden = true; }, 8000);
+    }
   };
 
   document.getElementById('resumeBtn').onclick = async () => {
@@ -103,7 +119,7 @@
         </div>`).join('');
 
     document.getElementById('queue').innerHTML = s.waiting.length === 0
-      ? '<div class="empty">No one is waiting</div>'
+      ? '<div class="empty">No one is waiting at your counter</div>'
       : s.waiting.map(t => `
         <div class="q-item">
           <div style="display:flex;align-items:center">

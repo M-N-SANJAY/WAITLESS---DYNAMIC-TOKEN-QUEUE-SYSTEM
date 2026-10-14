@@ -40,10 +40,20 @@
 
       <div class="eta-sub" id="aheadNote" style="margin-top:10px;font-size:13px"></div>
       <div class="eta-sub" id="sourceNote" style="font-size:12px;opacity:.7"></div>
+      <div id="blockedNote" hidden style="margin-top:14px;padding:12px;border-radius:10px;
+           background:rgba(248,113,113,.12);border:1px solid rgba(248,113,113,.3);
+           color:#fca5a5;font-size:14px">
+        ⚠️ No staff currently available for your service. Please wait — we'll notify you when someone is free.
+      </div>
 
-      <button class="btn ghost small" id="notifyBtn" style="margin-top:14px">
-        🔔 Notify me when it's almost my turn
-      </button>
+      <div style="display:flex;gap:8px;justify-content:center;margin-top:18px;flex-wrap:wrap">
+        <button class="btn ghost small" id="notifyBtn">
+          🔔 Notify me when it's almost my turn
+        </button>
+        <button class="btn ghost small" id="withdrawBtn" style="border-color:rgba(248,113,113,.4);color:#fca5a5">
+          Withdraw my token
+        </button>
+      </div>
     </div>
   </div>
 
@@ -54,8 +64,7 @@
       <span data-val="1">★</span><span data-val="2">★</span>
       <span data-val="3">★</span><span data-val="4">★</span><span data-val="5">★</span>
     </div>
-    <textarea id="comment" placeholder="Optional comment" rows="2"
-      style="margin:8px 0"></textarea>
+    <textarea id="comment" placeholder="Optional comment" rows="2" style="margin:8px 0"></textarea>
     <button class="btn" id="submitFeedback" style="margin-top:8px">Submit feedback</button>
     <div id="feedbackDone" hidden style="margin-top:12px;color:var(--good);font-weight:600">
       Thanks for your feedback! 🙏
@@ -78,6 +87,8 @@ let lastDoneTokenId = null;
 document.getElementById('issueBtn').onclick = async () => {
   const name = document.getElementById('custName').value.trim();
   if (!name) { document.getElementById('custName').focus(); return; }
+  notifiedAtPosition = null;
+  prevEtaMinutes = null;
   const r = await fetch('/api/token', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -89,7 +100,7 @@ document.getElementById('issueBtn').onclick = async () => {
   if (!r.ok) { const e = await r.json(); alert(e.error || 'Failed'); return; }
 };
 
-// ---------------- NOTIFICATION PERMISSION ----------------
+// ---------------- NOTIFICATIONS ----------------
 document.getElementById('notifyBtn').onclick = async () => {
   if (!('Notification' in window)) return alert('Notifications not supported in this browser');
   const perm = await Notification.requestPermission();
@@ -106,23 +117,31 @@ if ('Notification' in window && Notification.permission === 'granted') {
   document.getElementById('notifyBtn').disabled = true;
 }
 
+// ---------------- WITHDRAW ----------------
+document.getElementById('withdrawBtn').onclick = async () => {
+  if (!confirm('Withdraw your token? You will lose your place in the queue.')) return;
+  const r = await fetch('/api/withdraw', { method: 'POST' });
+  if (!r.ok) { const e = await r.json(); alert(e.error || 'Failed'); return; }
+  // reset state
+  notifiedAtPosition = null;
+  prevEtaMinutes = null;
+  document.getElementById('custName').value = '';
+};
+
 // ---------------- FEEDBACK ----------------
 let selectedRating = 0;
 document.querySelectorAll('#stars span').forEach(s => {
   s.onclick = () => {
     selectedRating = parseInt(s.dataset.val);
     document.querySelectorAll('#stars span').forEach(x => {
-      const on = parseInt(x.dataset.val) <= selectedRating;
-      x.classList.toggle('on', on);
+      x.classList.toggle('on', parseInt(x.dataset.val) <= selectedRating);
     });
   };
 });
 
 document.getElementById('submitFeedback').onclick = async () => {
   if (!selectedRating) return alert('Please select a rating');
-  if (!lastDoneTokenId) return;
-  if (feedbackSubmittedFor === lastDoneTokenId) return;
-
+  if (!lastDoneTokenId || feedbackSubmittedFor === lastDoneTokenId) return;
   const r = await fetch('/api/feedback', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -171,17 +190,27 @@ function render(s) {
   if (t.status === 'done' || t.status === 'cancelled') {
     issue.hidden = true; tok.hidden = true; done.hidden = false;
     if (t.status === 'done' && t._id) lastDoneTokenId = t._id;
+    if (t.status === 'cancelled') {
+      // Show issue form directly with a small toast
+      done.hidden = true;
+      issue.hidden = false;
+    }
     return;
   }
 
   done.hidden = true; tok.hidden = false; issue.hidden = true;
   document.getElementById('num').textContent = t.number;
 
-  const pill  = document.getElementById('statusPill');
+  const pill = document.getElementById('statusPill');
   const pause = document.getElementById('pausePill');
   pill.className = 'status-pill ' + t.status;
   pill.textContent = t.status;
-  pause.hidden = !(s.eta && s.eta.paused);
+
+  const paused = s.counter?.paused;
+  const hasAlt = s.counter?.hasAlternate !== false;
+  const blocked = s.eta?.blocked || (paused && !hasAlt);
+  pause.hidden = !paused;
+  document.getElementById('blockedNote').hidden = !blocked;
 
   const line = document.getElementById('etaLine');
   const range = document.getElementById('etaRange');
@@ -207,17 +236,15 @@ function render(s) {
   const etaEl = document.getElementById('etaNum');
   etaEl.textContent = mins;
 
-  // Clock time prediction
   const readyAt = new Date(Date.now() + s.eta.etaMinutes * 60000);
   const hh = readyAt.getHours();
   const mm = readyAt.getMinutes();
   const clockStr = `${((hh+11)%12)+1}:${mm.toString().padStart(2,'0')} ${hh<12?'AM':'PM'}`;
-  clockHint.textContent = `around ${clockStr}`;
+  clockHint.textContent = s.eta.blocked ? '' : `around ${clockStr}`;
 
-  // Animation on drop
-  if (prevEtaMinutes !== null && mins < prevEtaMinutes) {
+  if (prevEtaMinutes !== null && mins < prevEtaMinutes && !s.eta.blocked) {
     etaEl.classList.remove('eta-drop');
-    void etaEl.offsetWidth; // reflow to restart animation
+    void etaEl.offsetWidth;
     etaEl.classList.add('eta-drop');
     range.textContent = `↑ moved up · typically ${lo}–${hi} min`;
     range.classList.add('up-note');
@@ -228,10 +255,11 @@ function render(s) {
   prevEtaMinutes = mins;
 
   ahead.textContent = `${s.aheadCount} ${s.aheadCount === 1 ? 'person' : 'people'} ahead of you`;
-  src.textContent = s.eta.source === 'ml' ? 'live ML estimate' : 'live estimate';
+  src.textContent = s.eta.source === 'ml' ? 'live ML estimate (all counters considered)'
+    : s.eta.source === 'naive' ? 'live estimate (fallback)'
+    : 'live multi-counter estimate';
 
-  // Notification when 2 or fewer positions remain
-  if (Notification.permission === 'granted' && s.aheadCount <= 2) {
+  if (Notification.permission === 'granted' && s.aheadCount <= 2 && !s.eta.blocked) {
     if (notifiedAtPosition !== s.aheadCount) {
       notifiedAtPosition = s.aheadCount;
       new Notification('Almost your turn!', {
@@ -243,12 +271,4 @@ function render(s) {
     }
   }
 }
-
-// reset notification tracker when a new token is issued
-const _origIssue = document.getElementById('issueBtn').onclick;
-document.getElementById('issueBtn').onclick = async (e) => {
-  notifiedAtPosition = null;
-  prevEtaMinutes = null;
-  return _origIssue(e);
-};
 </script></body></html>
