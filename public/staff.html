@@ -1,0 +1,77 @@
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Staff</title><link rel="stylesheet" href="/app.css">
+</head><body>
+<div class="topbar">
+  <div class="brand"><span class="dot"></span> WaitLess</div>
+  <div class="user">
+    <span class="pill" id="who">—</span>
+    <button class="btn ghost small" id="logout">Logout</button>
+  </div>
+</div>
+<div class="container">
+  <div class="card" style="display:flex;justify-content:space-between;align-items:center">
+    <div>
+      <div style="font-size:12px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">Your counter</div>
+      <div style="font-size:20px;font-weight:700;margin-top:4px" id="counterName">—</div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:12px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">In queue</div>
+      <div style="font-size:20px;font-weight:700;margin-top:4px" id="totalWaiting">0</div>
+    </div>
+  </div>
+
+  <div class="card"><h2>Now serving</h2><div id="serving"></div></div>
+  <div class="card"><h2>Waiting queue</h2><div id="queue"></div></div>
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/common.js"></script>
+<script>
+(async () => {
+  const me = await requireRole('staff');
+  document.getElementById('who').textContent = me.name || 'Staff';
+  document.getElementById('logout').onclick = async () => {
+    await fetch('/api/logout', { method: 'POST' });
+    location.href = '/login.html';
+  };
+
+  window.start = async id => await fetch('/api/start/' + id, { method: 'POST' });
+  window.done  = async id => await fetch('/api/done/'  + id, { method: 'POST' });
+
+  const socket = io();
+  socket.on('connect_error', () => location.href = '/login.html');
+
+  socket.on('state', s => {
+    document.getElementById('counterName').textContent = s.counter?.name || '—';
+    document.getElementById('totalWaiting').textContent = s.totalWaiting ?? 0;
+
+    document.getElementById('serving').innerHTML = s.serving.length === 0
+      ? '<div class="empty">No customer is being served</div>'
+      : s.serving.map(t => `
+        <div class="q-item" style="border-color:rgba(52,211,153,.4);background:linear-gradient(180deg,rgba(52,211,153,.08),transparent)">
+          <div style="display:flex;align-items:center">
+            <div class="num">${t.number}</div>
+            <div>
+              <div class="name">${escapeHtml(t.customerName)}</div>
+              <div class="meta">${t.serviceType} · elapsed ${fmtSeconds(t.elapsedMs)}</div>
+            </div>
+          </div>
+          <button class="btn good small" onclick="done('${t._id}')">Mark done</button>
+        </div>`).join('');
+
+    document.getElementById('queue').innerHTML = s.waiting.length === 0
+      ? '<div class="empty">No one is waiting</div>'
+      : s.waiting.map(t => `
+        <div class="q-item">
+          <div style="display:flex;align-items:center">
+            <div class="num">${t.number}</div>
+            <div>
+              <div class="name">${escapeHtml(t.customerName)}</div>
+              <div class="meta">${t.serviceType} · est wait ${fmtMinutes(t.estimatedWaitMs)}</div>
+            </div>
+          </div>
+          <button class="btn small" onclick="start('${t._id}')">Start service</button>
+        </div>`).join('');
+  });
+})();
+</script></body></html>

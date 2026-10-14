@@ -1,0 +1,128 @@
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Get a Token</title><link rel="stylesheet" href="/app.css">
+</head><body>
+<div class="topbar">
+  <div class="brand"><span class="dot"></span> WaitLess</div>
+</div>
+<div class="container">
+  <div id="issueCard" class="card" hidden>
+    <h2>Take a token</h2>
+    <div class="stack">
+      <input id="custName" placeholder="Your name" autofocus>
+      <select id="serviceType">
+        <option value="general">General enquiry</option>
+        <option value="billing">Billing</option>
+        <option value="consultation">Consultation</option>
+      </select>
+      <button class="btn" id="issueBtn">Get my token</button>
+    </div>
+  </div>
+
+  <div id="tokenCard" class="card" hidden>
+    <div class="eta-wrap">
+      <div class="eta-label">Your token</div>
+      <div style="font-size:22px;font-weight:700;margin-bottom:20px">#<span id="num">—</span></div>
+      <div class="eta-label">Estimated wait</div>
+      <div id="etaLine">
+        <span class="eta-big" id="etaNum">—</span>
+        <span class="eta-unit" id="etaUnit">min</span>
+      </div>
+      <div class="eta-sub" id="etaRange">Getting a reading…</div>
+      <div style="margin-top:16px">
+        <span class="status-pill waiting" id="statusPill">waiting</span>
+      </div>
+      <div class="eta-sub" id="aheadNote" style="margin-top:10px;font-size:13px"></div>
+      <div class="eta-sub" id="sourceNote" style="font-size:12px;opacity:.7"></div>
+    </div>
+  </div>
+
+  <div id="doneCard" class="card" hidden style="text-align:center">
+    <h2>Service complete</h2>
+    <p style="color:var(--muted)">Thanks for visiting. Take a new token below if needed.</p>
+    <button class="btn" id="againBtn">Take another token</button>
+  </div>
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/common.js"></script>
+<script>
+const socket = io();
+
+document.getElementById('issueBtn').onclick = async () => {
+  const name = document.getElementById('custName').value.trim();
+  if (!name) { document.getElementById('custName').focus(); return; }
+  const r = await fetch('/api/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      customerName: name,
+      serviceType: document.getElementById('serviceType').value,
+    }),
+  });
+  if (!r.ok) { const e = await r.json(); alert(e.error || 'Failed'); return; }
+};
+
+document.getElementById('againBtn').onclick = () => {
+  document.getElementById('doneCard').hidden = true;
+  document.getElementById('issueCard').hidden = false;
+  document.getElementById('custName').focus();
+};
+
+socket.on('connect_error', () => { /* silent */ });
+socket.on('state', render);
+
+function render(s) {
+  const issue  = document.getElementById('issueCard');
+  const tok    = document.getElementById('tokenCard');
+  const done   = document.getElementById('doneCard');
+
+  if (!s || !s.token) {
+    issue.hidden = false;
+    tok.hidden = true;
+    done.hidden = true;
+    return;
+  }
+
+  const t = s.token;
+
+  if (t.status === 'done' || t.status === 'cancelled') {
+    issue.hidden = true;
+    tok.hidden = true;
+    done.hidden = false;
+    return;
+  }
+
+  done.hidden = true;
+  tok.hidden = false;
+  issue.hidden = true;
+
+  document.getElementById('num').textContent = t.number;
+
+  const pill = document.getElementById('statusPill');
+  pill.className = 'status-pill ' + t.status;
+  pill.textContent = t.status;
+
+  const line  = document.getElementById('etaLine');
+  const range = document.getElementById('etaRange');
+  const ahead = document.getElementById('aheadNote');
+  const src   = document.getElementById('sourceNote');
+
+  if (t.status === 'serving') {
+    line.innerHTML = '<span class="eta-big" style="background:linear-gradient(135deg,#34d399,#10b981);-webkit-background-clip:text;background-clip:text;color:transparent">Now</span>';
+    range.textContent = 'You are being served';
+    ahead.textContent = '';
+    src.textContent = '';
+    return;
+  }
+
+  if (!s.eta) return;
+  const mins = Math.max(0, Math.round(s.eta.etaMinutes));
+  const lo = Math.max(0, Math.round(s.eta.p10Minutes));
+  const hi = Math.max(lo + 1, Math.round(s.eta.p90Minutes));
+
+  document.getElementById('etaNum').textContent = mins;
+  range.textContent = `typically ${lo}–${hi} min`;
+  ahead.textContent = `${s.aheadCount} ${s.aheadCount === 1 ? 'person' : 'people'} ahead of you`;
+  src.textContent = s.eta.source === 'ml' ? 'live ML estimate' : 'live estimate';
+}
+</script></body></html>

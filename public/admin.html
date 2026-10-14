@@ -1,0 +1,100 @@
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Admin</title><link rel="stylesheet" href="/app.css">
+</head><body>
+<div class="topbar">
+  <div class="brand"><span class="dot"></span> WaitLess · Admin</div>
+  <div class="user">
+    <span class="pill" id="who">—</span>
+    <button class="btn ghost small" id="retrain">Retrain ML</button>
+    <button class="btn ghost small" id="logout">Logout</button>
+  </div>
+</div>
+<div class="container">
+  <div class="kpis">
+    <div class="kpi"><div class="n" id="served">0</div><div class="l">Served</div></div>
+    <div class="kpi"><div class="n" id="waiting">0</div><div class="l">Waiting</div></div>
+    <div class="kpi"><div class="n" id="serving">0</div><div class="l">Serving</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Counters</h2>
+    <table>
+      <thead><tr><th>Counter</th><th>Staff</th><th>Served</th><th>Avg</th><th>Now serving</th></tr></thead>
+      <tbody id="counterStats"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>By service type</h2>
+    <table>
+      <thead><tr><th>Service</th><th>Count</th><th>Avg duration</th></tr></thead>
+      <tbody id="stats"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>Last 10 completed</h2>
+    <table>
+      <thead><tr><th>Service</th><th>Duration</th><th>Ended</th></tr></thead>
+      <tbody id="recent"></tbody>
+    </table>
+  </div>
+</div>
+<script src="/socket.io/socket.io.js"></script>
+<script src="/common.js"></script>
+<script>
+(async () => {
+  const me = await requireRole('admin');
+  document.getElementById('who').textContent = me.name || 'Admin';
+
+  document.getElementById('logout').onclick = async () => {
+    await fetch('/api/logout', { method: 'POST' });
+    location.href = '/login.html';
+  };
+  document.getElementById('retrain').onclick = async () => {
+    const r = await fetch('/api/admin/retrain', { method: 'POST' });
+    alert(r.ok ? 'ML models retrained' : 'Retrain failed');
+  };
+
+  const socket = io();
+  socket.on('connect_error', () => location.href = '/login.html');
+
+  socket.on('state', s => {
+    document.getElementById('served').textContent  = s.totalServed;
+    document.getElementById('waiting').textContent = s.waiting;
+    document.getElementById('serving').textContent = s.serving;
+
+    document.getElementById('counterStats').innerHTML = s.counterStats.map(c => `
+      <tr>
+        <td>${escapeHtml(c.counterName)}</td>
+        <td>${escapeHtml(c.staffName)}</td>
+        <td>${c.served}</td>
+        <td>${c.avgMs ? (c.avgMs / 60000).toFixed(1) + ' min' : '—'}</td>
+        <td>${c.current ? `#${c.current.number} ${escapeHtml(c.current.name)}` : '<span class="empty">idle</span>'}</td>
+      </tr>`).join('');
+
+    const max = Math.max(1, ...s.stats.map(x => x.avgMs));
+    document.getElementById('stats').innerHTML = s.stats.length === 0
+      ? '<tr><td colspan="3" class="empty">No completed services yet</td></tr>'
+      : s.stats.map(x => `
+        <tr>
+          <td>${escapeHtml(x.serviceType)}</td>
+          <td>${x.count}</td>
+          <td>
+            ${(x.avgMs / 60000).toFixed(1)} min
+            <div class="bar" style="width:${(x.avgMs / max * 100).toFixed(0)}%"></div>
+          </td>
+        </tr>`).join('');
+
+    document.getElementById('recent').innerHTML = s.recent.length === 0
+      ? '<tr><td colspan="3" class="empty">No activity yet</td></tr>'
+      : s.recent.map(e => `
+        <tr>
+          <td>${escapeHtml(e.serviceType)}</td>
+          <td>${(e.durationMs / 60000).toFixed(1)} min</td>
+          <td>${new Date(e.endedAt).toLocaleTimeString()}</td>
+        </tr>`).join('');
+  });
+})();
+</script></body></html>

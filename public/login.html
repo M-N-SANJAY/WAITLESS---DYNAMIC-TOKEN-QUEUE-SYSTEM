@@ -1,0 +1,46 @@
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Staff / Admin Sign in</title><link rel="stylesheet" href="/app.css">
+<style>
+.login-wrap{max-width:420px;margin:8vh auto;padding:0 20px}
+h1{font-size:28px;margin:0 0 4px;letter-spacing:-.02em}
+.sub{color:var(--muted);margin:0 0 24px}
+.hint{color:var(--muted);font-size:13px;margin-top:14px;text-align:center;line-height:1.6}
+.hint code{background:var(--panel-2);padding:1px 6px;border-radius:4px;color:var(--text)}
+.back{color:var(--muted);font-size:13px;margin-top:20px;text-align:center;display:block;text-decoration:none}
+.back:hover{color:var(--accent)}
+</style></head><body>
+<div class="login-wrap">
+  <h1>WaitLess</h1>
+  <p class="sub">Staff / Admin sign in</p>
+  <div class="card">
+    <div class="stack">
+      <input id="username" placeholder="Username" autofocus>
+      <input id="password" type="password" placeholder="Password">
+      <button class="btn" id="loginBtn">Sign in</button>
+    </div>
+    <div class="hint">
+      Staff: <code>staff1</code> · <code>staff2</code> · <code>staff3</code> — pw <code>staff123</code><br>
+      Admin: <code>admin</code> — pw <code>admin123</code>
+    </div>
+  </div>
+  <a class="back" href="/customer.html">→ I'm a customer, just get a token</a>
+</div>
+<script>
+document.getElementById('loginBtn').onclick = doLogin;
+document.getElementById('password').onkeydown = e => { if (e.key === 'Enter') doLogin(); };
+
+async function doLogin() {
+  const r = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      username: document.getElementById('username').value.trim(),
+      password: document.getElementById('password').value,
+    }),
+  });
+  if (!r.ok) { alert('Invalid credentials'); return; }
+  const j = await r.json();
+  location.href = j.redirect;
+}
+</script></body></html>
