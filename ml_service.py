@@ -148,3 +148,6 @@ def predict(req: PredictRequest):
         "p10Minutes": float(np.quantile(sims, 0.10)),
         "p90Minutes": float(np.quantile(sims, 0.90)),
     }
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)
