@@ -1,6 +1,7 @@
 <!doctype html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Admin</title><link rel="stylesheet" href="/app.css">
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 </head><body>
 <div class="topbar">
   <div class="brand"><span class="dot"></span> WaitLess · Admin</div>
@@ -11,6 +12,7 @@
   </div>
 </div>
 <div class="container">
+
   <div class="kpis">
     <div class="kpi"><div class="n" id="served">0</div><div class="l">Served</div></div>
     <div class="kpi"><div class="n" id="waiting">0</div><div class="l">Waiting</div></div>
@@ -18,9 +20,19 @@
   </div>
 
   <div class="card">
+    <h2>Average service duration by hour</h2>
+    <canvas id="timeChart" height="120"></canvas>
+  </div>
+
+  <div class="card">
+    <h2>Peak hours heatmap (last 7 days of events)</h2>
+    <div class="heatmap" id="heatmap"></div>
+  </div>
+
+  <div class="card">
     <h2>Counters</h2>
     <table>
-      <thead><tr><th>Counter</th><th>Staff</th><th>Served</th><th>Avg</th><th>Now serving</th></tr></thead>
+      <thead><tr><th>Counter</th><th>Staff</th><th>Served</th><th>Avg</th><th>Rating</th><th>Now serving</th></tr></thead>
       <tbody id="counterStats"></tbody>
     </table>
   </div>
@@ -34,6 +46,14 @@
   </div>
 
   <div class="card">
+    <h2>Recent feedback</h2>
+    <table>
+      <thead><tr><th>Rating</th><th>Counter</th><th>Comment</th><th>When</th></tr></thead>
+      <tbody id="feedback"></tbody>
+    </table>
+  </div>
+
+  <div class="card">
     <h2>Last 10 completed</h2>
     <table>
       <thead><tr><th>Service</th><th>Duration</th><th>Ended</th></tr></thead>
@@ -41,6 +61,7 @@
     </table>
   </div>
 </div>
+
 <script src="/socket.io/socket.io.js"></script>
 <script src="/common.js"></script>
 <script>
@@ -57,6 +78,77 @@
     alert(r.ok ? 'ML models retrained' : 'Retrain failed');
   };
 
+  // ---- Timeseries chart (fetch once, redraw on new data every 30s)
+  let chart = null;
+  async function loadTimeseries() {
+    const r = await fetch('/api/admin/timeseries');
+    if (!r.ok) return;
+    const data = await r.json();
+    const labels = data.map(d => d.hour + ':00');
+    const values = data.map(d => d.avgMin);
+
+    if (chart) {
+      chart.data.labels = labels;
+      chart.data.datasets[0].data = values;
+      chart.update('none');
+    } else {
+      chart = new Chart(document.getElementById('timeChart'), {
+        type: 'line',
+        data: {
+          labels,
+          datasets: [{
+            label: 'Avg duration (min)',
+            data: values,
+            borderColor: '#5b8cff',
+            backgroundColor: 'rgba(91,140,255,0.15)',
+            fill: true,
+            tension: 0.35,
+            pointRadius: 3,
+          }],
+        },
+        options: {
+          plugins: { legend: { display: false } },
+          scales: {
+            x: { ticks: { color: '#8b95a7' }, grid: { color: '#262c38' } },
+            y: { ticks: { color: '#8b95a7' }, grid: { color: '#262c38' }, beginAtZero: true },
+          },
+        },
+      });
+    }
+  }
+
+  // ---- Heatmap (fetch once, then refresh every 30s)
+  async function loadHeatmap() {
+    const r = await fetch('/api/admin/heatmap');
+    if (!r.ok) return;
+    const data = await r.json();
+    const max = Math.max(1, ...data.map(x => x.count));
+
+    const grid = document.getElementById('heatmap');
+    const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+    let html = '<div class="lbl"></div>';
+    for (let h = 0; h < 24; h++) html += `<div class="hr">${h}</div>`;
+
+    for (let d = 0; d < 7; d++) {
+      html += `<div class="lbl">${days[d]}</div>`;
+      for (let h = 0; h < 24; h++) {
+        const cell = data.find(x => x._id.day === d + 1 && x._id.hour === h);
+        const count = cell ? cell.count : 0;
+        const intensity = count / max;
+        const bg = `rgba(91,140,255,${(0.05 + intensity * 0.85).toFixed(2)})`;
+        html += `<div class="cell" style="background:${bg}" title="${days[d]} ${h}:00 — ${count} services"></div>`;
+      }
+    }
+    grid.innerHTML = html;
+  }
+
+  loadTimeseries();
+  loadHeatmap();
+  setInterval(loadTimeseries, 30000);
+  setInterval(loadHeatmap, 30000);
+
+  // ---- Live socket updates
   const socket = io();
   socket.on('connect_error', () => location.href = '/login.html');
 
@@ -67,10 +159,11 @@
 
     document.getElementById('counterStats').innerHTML = s.counterStats.map(c => `
       <tr>
-        <td>${escapeHtml(c.counterName)}</td>
+        <td>${escapeHtml(c.counterName)} ${c.isPaused ? '<span class="badge paused">paused</span>' : ''}</td>
         <td>${escapeHtml(c.staffName)}</td>
         <td>${c.served}</td>
         <td>${c.avgMs ? (c.avgMs / 60000).toFixed(1) + ' min' : '—'}</td>
+        <td>${c.ratingCount ? `${c.ratingAvg.toFixed(1)} ★ (${c.ratingCount})` : '—'}</td>
         <td>${c.current ? `#${c.current.number} ${escapeHtml(c.current.name)}` : '<span class="empty">idle</span>'}</td>
       </tr>`).join('');
 
@@ -81,10 +174,19 @@
         <tr>
           <td>${escapeHtml(x.serviceType)}</td>
           <td>${x.count}</td>
-          <td>
-            ${(x.avgMs / 60000).toFixed(1)} min
+          <td>${(x.avgMs / 60000).toFixed(1)} min
             <div class="bar" style="width:${(x.avgMs / max * 100).toFixed(0)}%"></div>
           </td>
+        </tr>`).join('');
+
+    document.getElementById('feedback').innerHTML = s.recentFeedback.length === 0
+      ? '<tr><td colspan="4" class="empty">No feedback yet</td></tr>'
+      : s.recentFeedback.map(f => `
+        <tr>
+          <td style="color:#fbbf24">${'★'.repeat(f.rating)}${'☆'.repeat(5 - f.rating)}</td>
+          <td>${escapeHtml(f.counterName)}</td>
+          <td>${escapeHtml(f.comment) || '<span class="empty">—</span>'}</td>
+          <td>${new Date(f.at).toLocaleTimeString()}</td>
         </tr>`).join('');
 
     document.getElementById('recent').innerHTML = s.recent.length === 0

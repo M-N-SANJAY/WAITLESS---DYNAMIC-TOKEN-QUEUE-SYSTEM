@@ -5,7 +5,7 @@ const cookieParser = require('cookie-parser');
 const bcrypt = require('bcryptjs');
 const path = require('path');
 const { Server } = require('socket.io');
-const { connect, Counter, User, Token, ServiceEvent } = require('./db');
+const { connect, Counter, User, Token, ServiceEvent, Feedback } = require('./db');
 
 const app = express();
 const server = http.createServer(app);
@@ -17,25 +17,17 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const ML_URL = process.env.ML_URL || 'http://127.0.0.1:8000';
 
-// ---------------- SESSIONS (in-memory) ----------------
-// { sid -> { role, userId?, counterId?, name, tokenId? } }
+// ---------------- SESSIONS ----------------
 const sessions = new Map();
 
-// Auto-guest middleware — every visitor gets a session on first request.
-// Customers are BORN with role='customer'. Staff/admin must call /api/login to upgrade.
 app.use((req, res, next) => {
   let sid = req.cookies?.sid;
   let session = sid && sessions.get(sid);
-
   if (!session) {
     sid = crypto.randomBytes(24).toString('hex');
     session = { role: 'customer', tokenId: null, createdAt: Date.now() };
     sessions.set(sid, session);
-    res.cookie('sid', sid, {
-      httpOnly: true,
-      sameSite: 'lax',
-      maxAge: 30 * 24 * 60 * 60 * 1000, // 30 days
-    });
+    res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 24 * 60 * 60 * 1000 });
   }
   req.session = { sid, ...session };
   next();
@@ -43,20 +35,16 @@ app.use((req, res, next) => {
 
 function requireRole(...roles) {
   return (req, res, next) => {
-    if (!roles.includes(req.session.role)) {
-      return res.status(403).json({ error: 'Forbidden' });
-    }
+    if (!roles.includes(req.session.role)) return res.status(403).json({ error: 'Forbidden' });
     next();
   };
 }
 
-// ---------------- TOKEN NUMBER COUNTER (in-memory) ----------------
 let nextNumber = 1;
 
 // ---------------- ESTIMATION ----------------
 async function recentAvgMs(serviceType, window = 20) {
-  const events = await ServiceEvent.find({ serviceType })
-    .sort('-endedAt').limit(window).lean();
+  const events = await ServiceEvent.find({ serviceType }).sort('-endedAt').limit(window).lean();
   if (events.length < 3) return 5 * 60 * 1000;
   return events.reduce((s, e) => s + e.durationMs, 0) / events.length;
 }
@@ -91,14 +79,27 @@ async function naiveEstimate(ahead) {
 }
 
 async function estimateWaitForToken(token) {
-  const ahead = await Token.find({
-    status: { $in: ['waiting', 'serving'] },
-    issuedAt: { $lt: token.issuedAt },
-    _id: { $ne: token._id },
-  }).sort('issuedAt').lean();
+  let ahead = [];
+  if (token.counterId) {
+    ahead = await Token.find({
+      status: { $in: ['waiting', 'serving'] },
+      issuedAt: { $lt: token.issuedAt },
+      _id: { $ne: token._id },
+      counterId: token.counterId,
+    }).sort('issuedAt').lean();
+  }
 
-  if (ahead.length === 0) {
-    return { etaMinutes: 0, p10Minutes: 0, p90Minutes: 0, source: 'none' };
+  // counter pause contribution
+  let pauseExtra = 0;
+  if (token.counterId) {
+    const c = await Counter.findById(token.counterId).lean();
+    if (c?.pausedUntil && new Date(c.pausedUntil) > new Date()) {
+      pauseExtra = new Date(c.pausedUntil) - Date.now();
+    }
+  }
+
+  if (ahead.length === 0 && pauseExtra === 0) {
+    return { etaMinutes: 0, p10Minutes: 0, p90Minutes: 0, source: 'none', paused: false };
   }
 
   const now = new Date();
@@ -108,13 +109,40 @@ async function estimateWaitForToken(token) {
     elapsedMs: t.status === 'serving' ? Date.now() - new Date(t.startedAt).getTime() : 0,
   }));
 
-  const ml = await mlPredict({
-    hour: now.getHours(),
-    dayOfWeek: now.getDay(),
-    ahead: payload,
-  });
-  if (ml) return { ...ml, source: 'ml' };
-  return naiveEstimate(payload);
+  let result;
+  if (payload.length > 0) {
+    const ml = await mlPredict({ hour: now.getHours(), dayOfWeek: now.getDay(), ahead: payload });
+    result = ml ? { ...ml, source: 'ml' } : await naiveEstimate(payload);
+  } else {
+    result = { etaMinutes: 0, p10Minutes: 0, p90Minutes: 0, source: 'none' };
+  }
+
+  const pauseMin = pauseExtra / 60000;
+  return {
+    etaMinutes: result.etaMinutes + pauseMin,
+    p10Minutes: result.p10Minutes + pauseMin,
+    p90Minutes: result.p90Minutes + pauseMin,
+    source: result.source,
+    paused: pauseMin > 0,
+  };
+}
+
+// ---------------- AUTO-ASSIGN ----------------
+async function leastBusyCounter(serviceType) {
+  const counters = await Counter.find({ isActive: true, serviceTypes: serviceType }).lean();
+  if (counters.length === 0) return null;
+
+  const now = Date.now();
+  const scored = await Promise.all(counters.map(async c => {
+    const serving = await Token.countDocuments({ counterId: c._id, status: 'serving' });
+    const waiting = await Token.countDocuments({ counterId: c._id, status: 'waiting' });
+    const isPaused = c.pausedUntil && new Date(c.pausedUntil) > now ? 1 : 0;
+    // serving weight higher because an in-progress customer blocks the counter
+    return { counter: c, score: serving * 2 + waiting + isPaused * 50 };
+  }));
+
+  scored.sort((a, b) => a.score - b.score);
+  return scored[0].counter;
 }
 
 // ---------------- VIEWS ----------------
@@ -122,13 +150,26 @@ async function customerView(session) {
   if (!session.tokenId) return { token: null };
   const token = await Token.findById(session.tokenId).lean();
   if (!token) return { token: null };
+
   const eta = token.status === 'waiting' ? await estimateWaitForToken(token) : null;
-  const aheadCount = await Token.countDocuments({
-    status: { $in: ['waiting', 'serving'] },
-    issuedAt: { $lt: token.issuedAt },
-    _id: { $ne: token._id },
-  });
-  return { token, eta, aheadCount, now: Date.now() };
+
+  let aheadCount = 0;
+  if (token.counterId) {
+    aheadCount = await Token.countDocuments({
+      status: { $in: ['waiting', 'serving'] },
+      issuedAt: { $lt: token.issuedAt },
+      _id: { $ne: token._id },
+      counterId: token.counterId,
+    });
+  }
+
+  let counter = null;
+  if (token.counterId) {
+    const c = await Counter.findById(token.counterId).lean();
+    if (c) counter = { name: c.name, paused: c.pausedUntil && new Date(c.pausedUntil) > new Date() };
+  }
+
+  return { token, eta, aheadCount, counter, now: Date.now() };
 }
 
 async function staffView(session) {
@@ -137,19 +178,19 @@ async function staffView(session) {
     ? await Counter.findById(session.counterId).lean()
     : null;
 
-  const serving = await Token.find({
-    status: 'serving',
+  const serving = await Token.find({ status: 'serving', counterId: session.counterId }).lean();
+
+  // Staff see only tokens assigned to their counter
+  const waiting = await Token.find({
+    status: 'waiting',
     counterId: session.counterId,
-  }).lean();
+  }).sort('issuedAt').limit(30).lean();
 
-  const waiting = await Token.find({ status: 'waiting' })
-    .sort('issuedAt').limit(30).lean();
-
-  // compute rough wait per waiting token (naive, cheap — ML is for customer view)
   const waitingWithEta = await Promise.all(waiting.map(async t => {
     const ahead = await Token.find({
       status: { $in: ['waiting', 'serving'] },
       issuedAt: { $lt: t.issuedAt },
+      counterId: session.counterId,
     }).lean();
     let total = 0;
     for (const a of ahead) total += await recentAvgMs(a.serviceType);
@@ -158,17 +199,21 @@ async function staffView(session) {
 
   return {
     now,
-    counter,
-    serving: serving.map(t => ({
-      ...t,
-      elapsedMs: now - new Date(t.startedAt).getTime(),
-    })),
+    counter: counter ? {
+      _id: counter._id,
+      name: counter.name,
+      pausedUntil: counter.pausedUntil,
+      pauseReason: counter.pauseReason,
+      isPaused: !!(counter.pausedUntil && new Date(counter.pausedUntil) > now),
+    } : null,
+    serving: serving.map(t => ({ ...t, elapsedMs: now - new Date(t.startedAt).getTime() })),
     waiting: waitingWithEta,
     totalWaiting: await Token.countDocuments({ status: 'waiting' }),
   };
 }
 
 async function adminView() {
+  const now = Date.now();
   const [totalServed, waiting, serving, counters] = await Promise.all([
     ServiceEvent.countDocuments(),
     Token.countDocuments({ status: 'waiting' }),
@@ -176,17 +221,11 @@ async function adminView() {
     Counter.find().lean(),
   ]);
 
-  // per-service stats
   const stats = await ServiceEvent.aggregate([
-    { $group: {
-        _id: '$serviceType',
-        count: { $sum: 1 },
-        avgMs: { $avg: '$durationMs' },
-    }},
+    { $group: { _id: '$serviceType', count: { $sum: 1 }, avgMs: { $avg: '$durationMs' } } },
     { $sort: { _id: 1 } },
   ]);
 
-  // per-counter stats
   const counterStats = await Promise.all(counters.map(async c => {
     const s = await ServiceEvent.aggregate([
       { $match: { counterId: c._id } },
@@ -194,29 +233,46 @@ async function adminView() {
     ]);
     const staff = await User.findOne({ counterId: c._id, role: 'staff' }).lean();
     const current = await Token.findOne({ counterId: c._id, status: 'serving' }).lean();
+    const fb = await Feedback.aggregate([
+      { $match: { counterId: c._id } },
+      { $group: { _id: null, avg: { $avg: '$rating' }, count: { $sum: 1 } } },
+    ]);
     return {
       counterName: c.name,
       staffName: staff?.name || '—',
       served: s[0]?.count || 0,
       avgMs: s[0]?.avgMs || 0,
+      ratingAvg: fb[0]?.avg || 0,
+      ratingCount: fb[0]?.count || 0,
+      isPaused: !!(c.pausedUntil && new Date(c.pausedUntil) > now),
       current: current ? { number: current.number, name: current.customerName } : null,
     };
   }));
 
   const recent = await ServiceEvent.find().sort('-endedAt').limit(10).lean();
 
+  const recentFeedback = await Feedback.find()
+    .sort('-createdAt').limit(10)
+    .populate('counterId', 'name')
+    .lean();
+
   return {
-    now: Date.now(),
+    now,
     totalServed, waiting, serving,
     stats: stats.map(x => ({ serviceType: x._id, count: x.count, avgMs: x.avgMs })),
     counterStats,
     recent,
+    recentFeedback: recentFeedback.map(f => ({
+      rating: f.rating,
+      comment: f.comment || '',
+      counterName: f.counterId?.name || '—',
+      at: f.createdAt,
+    })),
   };
 }
 
-// ---------------- BROADCAST (per-room) ----------------
+// ---------------- BROADCAST ----------------
 async function broadcastAll() {
-  // each customer gets only their own view
   const custJobs = [];
   for (const [sid, session] of sessions) {
     if (session.role === 'customer' && session.tokenId) {
@@ -228,8 +284,6 @@ async function broadcastAll() {
     }
   }
 
-  // staff: each staff room is shared by role — but we want per-counter views.
-  // Simplest: emit to a room 'counter_<id>' and each staff socket joins that room.
   const staffJobs = [];
   for (const [sid, session] of sessions) {
     if (session.role === 'staff' && session.counterId) {
@@ -257,7 +311,6 @@ app.post('/api/login', async (req, res) => {
   const ok = await bcrypt.compare(password, user.passwordHash);
   if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
 
-  // burn the old session, create a fresh one with the new role
   const oldSid = req.cookies?.sid;
   if (oldSid) sessions.delete(oldSid);
 
@@ -270,11 +323,7 @@ app.post('/api/login', async (req, res) => {
     tokenId: null,
     createdAt: Date.now(),
   });
-  res.cookie('sid', sid, {
-    httpOnly: true,
-    sameSite: 'lax',
-    maxAge: 30 * 24 * 60 * 60 * 1000,
-  });
+  res.cookie('sid', sid, { httpOnly: true, sameSite: 'lax', maxAge: 30 * 24 * 60 * 60 * 1000 });
 
   const redirect = user.role === 'admin' ? '/admin.html' : '/staff.html';
   res.json({ ok: true, role: user.role, name: user.name, redirect });
@@ -302,13 +351,15 @@ app.post('/api/token', requireRole('customer'), async (req, res) => {
     return res.status(400).json({ error: 'Name and service type required' });
   }
 
-  // already have an active token?
   if (req.session.tokenId) {
     const existing = await Token.findById(req.session.tokenId);
     if (existing && (existing.status === 'waiting' || existing.status === 'serving')) {
       return res.status(400).json({ error: 'You already have an active token' });
     }
   }
+
+  // Auto-assign to least busy counter supporting this service type
+  const counter = await leastBusyCounter(serviceType);
 
   const token = await Token.create({
     number: nextNumber++,
@@ -317,9 +368,9 @@ app.post('/api/token', requireRole('customer'), async (req, res) => {
     sessionId: req.session.sid,
     status: 'waiting',
     issuedAt: new Date(),
+    counterId: counter?._id || null,
   });
 
-  // attach to session
   const s = sessions.get(req.session.sid);
   if (s) s.tokenId = token._id.toString();
 
@@ -327,20 +378,42 @@ app.post('/api/token', requireRole('customer'), async (req, res) => {
   res.json(token);
 });
 
+app.post('/api/feedback', requireRole('customer'), async (req, res) => {
+  const { tokenId, rating, comment } = req.body || {};
+  if (!tokenId || !rating) return res.status(400).json({ error: 'tokenId and rating required' });
+
+  const token = await Token.findById(tokenId).lean();
+  if (!token) return res.status(404).json({ error: 'Token not found' });
+
+  const existing = await Feedback.findOne({ tokenId });
+  if (existing) return res.status(400).json({ error: 'Feedback already submitted' });
+
+  await Feedback.create({
+    tokenId,
+    rating,
+    comment: comment || '',
+    staffId: token.staffId,
+    counterId: token.counterId,
+  });
+
+  await broadcastAll();
+  res.json({ ok: true });
+});
+
 // ---------------- STAFF ----------------
 app.post('/api/start/:id', requireRole('staff'), async (req, res) => {
-  // atomic: only flip if still waiting
+  // Ensure counter isn't paused
+  const counter = await Counter.findById(req.session.counterId).lean();
+  if (counter?.pausedUntil && new Date(counter.pausedUntil) > new Date()) {
+    return res.status(409).json({ error: 'Counter is paused' });
+  }
+
   const token = await Token.findOneAndUpdate(
-    { _id: req.params.id, status: 'waiting' },
-    {
-      status: 'serving',
-      startedAt: new Date(),
-      counterId: req.session.counterId,
-      staffId: req.session.userId,
-    },
+    { _id: req.params.id, status: 'waiting', counterId: req.session.counterId },
+    { status: 'serving', startedAt: new Date(), staffId: req.session.userId },
     { new: true }
   );
-  if (!token) return res.status(409).json({ error: 'Token not waiting or already taken' });
+  if (!token) return res.status(409).json({ error: 'Not your counter or not waiting' });
   await broadcastAll();
   res.json(token);
 });
@@ -366,6 +439,28 @@ app.post('/api/done/:id', requireRole('staff'), async (req, res) => {
   res.json(token);
 });
 
+app.post('/api/pause', requireRole('staff'), async (req, res) => {
+  const minutes = Math.max(1, Math.min(120, req.body?.minutes || 10));
+  const reason = (req.body?.reason || 'Break').slice(0, 60);
+  const until = new Date(Date.now() + minutes * 60 * 1000);
+
+  await Counter.findByIdAndUpdate(req.session.counterId, {
+    pausedUntil: until,
+    pauseReason: reason,
+  });
+
+  await broadcastAll();
+  res.json({ ok: true, until });
+});
+
+app.post('/api/resume', requireRole('staff'), async (req, res) => {
+  await Counter.findByIdAndUpdate(req.session.counterId, {
+    $set: { pausedUntil: null, pauseReason: null },
+  });
+  await broadcastAll();
+  res.json({ ok: true });
+});
+
 // ---------------- ADMIN ----------------
 app.post('/api/admin/retrain', requireRole('admin'), async (req, res) => {
   try {
@@ -376,7 +471,33 @@ app.post('/api/admin/retrain', requireRole('admin'), async (req, res) => {
   }
 });
 
-// ---------------- SOCKET.IO ----------------
+app.get('/api/admin/timeseries', requireRole('admin'), async (req, res) => {
+  const data = await ServiceEvent.aggregate([
+    { $group: {
+        _id: { $hour: '$endedAt' },
+        avgDuration: { $avg: '$durationMs' },
+        count: { $sum: 1 },
+    } },
+    { $sort: { _id: 1 } },
+  ]);
+  res.json(data.map(d => ({
+    hour: d._id,
+    avgMin: +(d.avgDuration / 60000).toFixed(2),
+    count: d.count,
+  })));
+});
+
+app.get('/api/admin/heatmap', requireRole('admin'), async (req, res) => {
+  const data = await ServiceEvent.aggregate([
+    { $group: {
+        _id: { day: { $dayOfWeek: '$endedAt' }, hour: { $hour: '$endedAt' } },
+        count: { $sum: 1 },
+    } },
+  ]);
+  res.json(data);
+});
+
+// ---------------- SOCKET ----------------
 io.use((socket, next) => {
   const raw = socket.handshake.headers.cookie || '';
   const parsed = Object.fromEntries(
@@ -409,18 +530,14 @@ io.on('connection', async (socket) => {
   }
 });
 
-// ---------------- TICK + BOOT ----------------
+// ---------------- BOOT ----------------
 app.get('/', (req, res) => res.redirect('/customer.html'));
 
 async function boot() {
   await connect();
-
-  // recover token number
   const last = await Token.findOne().sort('-number').lean();
   nextNumber = (last?.number || 0) + 1;
-
   setInterval(broadcastAll, 3000);
-
   server.listen(3000, () => console.log('>>> http://localhost:3000'));
 }
 

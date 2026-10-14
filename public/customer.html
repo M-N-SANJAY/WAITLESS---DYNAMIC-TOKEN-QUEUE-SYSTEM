@@ -6,6 +6,7 @@
   <div class="brand"><span class="dot"></span> WaitLess</div>
 </div>
 <div class="container">
+
   <div id="issueCard" class="card" hidden>
     <h2>Take a token</h2>
     <div class="stack">
@@ -23,31 +24,57 @@
     <div class="eta-wrap">
       <div class="eta-label">Your token</div>
       <div style="font-size:22px;font-weight:700;margin-bottom:20px">#<span id="num">—</span></div>
+
       <div class="eta-label">Estimated wait</div>
       <div id="etaLine">
         <span class="eta-big" id="etaNum">—</span>
         <span class="eta-unit" id="etaUnit">min</span>
       </div>
       <div class="eta-sub" id="etaRange">Getting a reading…</div>
+      <div class="eta-sub" id="clockHint" style="font-size:13px;margin-top:4px"></div>
+
       <div style="margin-top:16px">
         <span class="status-pill waiting" id="statusPill">waiting</span>
+        <span class="status-pill paused" id="pausePill" hidden>counter on break</span>
       </div>
+
       <div class="eta-sub" id="aheadNote" style="margin-top:10px;font-size:13px"></div>
       <div class="eta-sub" id="sourceNote" style="font-size:12px;opacity:.7"></div>
+
+      <button class="btn ghost small" id="notifyBtn" style="margin-top:14px">
+        🔔 Notify me when it's almost my turn
+      </button>
     </div>
   </div>
 
   <div id="doneCard" class="card" hidden style="text-align:center">
     <h2>Service complete</h2>
-    <p style="color:var(--muted)">Thanks for visiting. Take a new token below if needed.</p>
-    <button class="btn" id="againBtn">Take another token</button>
+    <p style="color:var(--muted);margin:4px 0 12px">How was your visit?</p>
+    <div class="stars" id="stars">
+      <span data-val="1">★</span><span data-val="2">★</span>
+      <span data-val="3">★</span><span data-val="4">★</span><span data-val="5">★</span>
+    </div>
+    <textarea id="comment" placeholder="Optional comment" rows="2"
+      style="margin:8px 0"></textarea>
+    <button class="btn" id="submitFeedback" style="margin-top:8px">Submit feedback</button>
+    <div id="feedbackDone" hidden style="margin-top:12px;color:var(--good);font-weight:600">
+      Thanks for your feedback! 🙏
+    </div>
+    <button class="btn ghost small" id="againBtn" style="margin-top:16px">Take another token</button>
   </div>
 </div>
+
 <script src="/socket.io/socket.io.js"></script>
 <script src="/common.js"></script>
 <script>
 const socket = io();
 
+let prevEtaMinutes = null;
+let notifiedAtPosition = null;
+let feedbackSubmittedFor = null;
+let lastDoneTokenId = null;
+
+// ---------------- ISSUE TOKEN ----------------
 document.getElementById('issueBtn').onclick = async () => {
   const name = document.getElementById('custName').value.trim();
   if (!name) { document.getElementById('custName').focus(); return; }
@@ -62,56 +89,113 @@ document.getElementById('issueBtn').onclick = async () => {
   if (!r.ok) { const e = await r.json(); alert(e.error || 'Failed'); return; }
 };
 
+// ---------------- NOTIFICATION PERMISSION ----------------
+document.getElementById('notifyBtn').onclick = async () => {
+  if (!('Notification' in window)) return alert('Notifications not supported in this browser');
+  const perm = await Notification.requestPermission();
+  if (perm === 'granted') {
+    document.getElementById('notifyBtn').textContent = '✅ Notifications enabled';
+    document.getElementById('notifyBtn').disabled = true;
+    new Notification('WaitLess', { body: 'You will be notified when your turn is near.' });
+  } else {
+    alert('Please allow notifications in your browser settings.');
+  }
+};
+if ('Notification' in window && Notification.permission === 'granted') {
+  document.getElementById('notifyBtn').textContent = '✅ Notifications enabled';
+  document.getElementById('notifyBtn').disabled = true;
+}
+
+// ---------------- FEEDBACK ----------------
+let selectedRating = 0;
+document.querySelectorAll('#stars span').forEach(s => {
+  s.onclick = () => {
+    selectedRating = parseInt(s.dataset.val);
+    document.querySelectorAll('#stars span').forEach(x => {
+      const on = parseInt(x.dataset.val) <= selectedRating;
+      x.classList.toggle('on', on);
+    });
+  };
+});
+
+document.getElementById('submitFeedback').onclick = async () => {
+  if (!selectedRating) return alert('Please select a rating');
+  if (!lastDoneTokenId) return;
+  if (feedbackSubmittedFor === lastDoneTokenId) return;
+
+  const r = await fetch('/api/feedback', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      tokenId: lastDoneTokenId,
+      rating: selectedRating,
+      comment: document.getElementById('comment').value,
+    }),
+  });
+  if (r.ok) {
+    feedbackSubmittedFor = lastDoneTokenId;
+    document.getElementById('feedbackDone').hidden = false;
+    document.getElementById('submitFeedback').disabled = true;
+  }
+};
+
 document.getElementById('againBtn').onclick = () => {
   document.getElementById('doneCard').hidden = true;
   document.getElementById('issueCard').hidden = false;
-  document.getElementById('custName').focus();
+  document.getElementById('custName').value = '';
+  selectedRating = 0;
+  feedbackSubmittedFor = null;
+  lastDoneTokenId = null;
+  document.querySelectorAll('#stars span').forEach(x => x.classList.remove('on'));
+  document.getElementById('comment').value = '';
+  document.getElementById('feedbackDone').hidden = true;
+  document.getElementById('submitFeedback').disabled = false;
 };
 
+// ---------------- SOCKET ----------------
 socket.on('connect_error', () => { /* silent */ });
 socket.on('state', render);
 
 function render(s) {
-  const issue  = document.getElementById('issueCard');
-  const tok    = document.getElementById('tokenCard');
-  const done   = document.getElementById('doneCard');
+  const issue = document.getElementById('issueCard');
+  const tok   = document.getElementById('tokenCard');
+  const done  = document.getElementById('doneCard');
 
   if (!s || !s.token) {
-    issue.hidden = false;
-    tok.hidden = true;
-    done.hidden = true;
+    issue.hidden = false; tok.hidden = true; done.hidden = true;
     return;
   }
 
   const t = s.token;
 
   if (t.status === 'done' || t.status === 'cancelled') {
-    issue.hidden = true;
-    tok.hidden = true;
-    done.hidden = false;
+    issue.hidden = true; tok.hidden = true; done.hidden = false;
+    if (t.status === 'done' && t._id) lastDoneTokenId = t._id;
     return;
   }
 
-  done.hidden = true;
-  tok.hidden = false;
-  issue.hidden = true;
-
+  done.hidden = true; tok.hidden = false; issue.hidden = true;
   document.getElementById('num').textContent = t.number;
 
-  const pill = document.getElementById('statusPill');
+  const pill  = document.getElementById('statusPill');
+  const pause = document.getElementById('pausePill');
   pill.className = 'status-pill ' + t.status;
   pill.textContent = t.status;
+  pause.hidden = !(s.eta && s.eta.paused);
 
-  const line  = document.getElementById('etaLine');
+  const line = document.getElementById('etaLine');
   const range = document.getElementById('etaRange');
+  const clockHint = document.getElementById('clockHint');
   const ahead = document.getElementById('aheadNote');
-  const src   = document.getElementById('sourceNote');
+  const src = document.getElementById('sourceNote');
 
   if (t.status === 'serving') {
     line.innerHTML = '<span class="eta-big" style="background:linear-gradient(135deg,#34d399,#10b981);-webkit-background-clip:text;background-clip:text;color:transparent">Now</span>';
     range.textContent = 'You are being served';
+    clockHint.textContent = '';
     ahead.textContent = '';
     src.textContent = '';
+    prevEtaMinutes = 0;
     return;
   }
 
@@ -120,9 +204,51 @@ function render(s) {
   const lo = Math.max(0, Math.round(s.eta.p10Minutes));
   const hi = Math.max(lo + 1, Math.round(s.eta.p90Minutes));
 
-  document.getElementById('etaNum').textContent = mins;
-  range.textContent = `typically ${lo}–${hi} min`;
+  const etaEl = document.getElementById('etaNum');
+  etaEl.textContent = mins;
+
+  // Clock time prediction
+  const readyAt = new Date(Date.now() + s.eta.etaMinutes * 60000);
+  const hh = readyAt.getHours();
+  const mm = readyAt.getMinutes();
+  const clockStr = `${((hh+11)%12)+1}:${mm.toString().padStart(2,'0')} ${hh<12?'AM':'PM'}`;
+  clockHint.textContent = `around ${clockStr}`;
+
+  // Animation on drop
+  if (prevEtaMinutes !== null && mins < prevEtaMinutes) {
+    etaEl.classList.remove('eta-drop');
+    void etaEl.offsetWidth; // reflow to restart animation
+    etaEl.classList.add('eta-drop');
+    range.textContent = `↑ moved up · typically ${lo}–${hi} min`;
+    range.classList.add('up-note');
+    setTimeout(() => range.classList.remove('up-note'), 1200);
+  } else {
+    range.textContent = `typically ${lo}–${hi} min`;
+  }
+  prevEtaMinutes = mins;
+
   ahead.textContent = `${s.aheadCount} ${s.aheadCount === 1 ? 'person' : 'people'} ahead of you`;
   src.textContent = s.eta.source === 'ml' ? 'live ML estimate' : 'live estimate';
+
+  // Notification when 2 or fewer positions remain
+  if (Notification.permission === 'granted' && s.aheadCount <= 2) {
+    if (notifiedAtPosition !== s.aheadCount) {
+      notifiedAtPosition = s.aheadCount;
+      new Notification('Almost your turn!', {
+        body: s.aheadCount === 0
+          ? `You're next. Please head to the counter.`
+          : `${s.aheadCount} ${s.aheadCount === 1 ? 'person' : 'people'} ahead of you.`,
+        tag: 'waittless-' + t._id,
+      });
+    }
+  }
 }
+
+// reset notification tracker when a new token is issued
+const _origIssue = document.getElementById('issueBtn').onclick;
+document.getElementById('issueBtn').onclick = async (e) => {
+  notifiedAtPosition = null;
+  prevEtaMinutes = null;
+  return _origIssue(e);
+};
 </script></body></html>

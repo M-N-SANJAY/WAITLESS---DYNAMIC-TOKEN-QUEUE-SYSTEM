@@ -10,20 +10,30 @@
   </div>
 </div>
 <div class="container">
-  <div class="card" style="display:flex;justify-content:space-between;align-items:center">
+
+  <div class="card" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
     <div>
       <div style="font-size:12px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">Your counter</div>
       <div style="font-size:20px;font-weight:700;margin-top:4px" id="counterName">—</div>
     </div>
     <div style="text-align:right">
-      <div style="font-size:12px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">In queue</div>
-      <div style="font-size:20px;font-weight:700;margin-top:4px" id="totalWaiting">0</div>
+      <div style="font-size:12px;letter-spacing:.08em;color:var(--muted);text-transform:uppercase">In your queue</div>
+      <div style="font-size:20px;font-weight:700;margin-top:4px" id="myQueue">0</div>
+    </div>
+  </div>
+
+  <div class="card" id="pauseCard" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px">
+    <div id="pauseStatus" style="color:var(--muted)">🟢 Available</div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn warn small" id="pauseBtn">Take 10-min break</button>
+      <button class="btn good small" id="resumeBtn" hidden>Resume</button>
     </div>
   </div>
 
   <div class="card"><h2>Now serving</h2><div id="serving"></div></div>
   <div class="card"><h2>Waiting queue</h2><div id="queue"></div></div>
 </div>
+
 <script src="/socket.io/socket.io.js"></script>
 <script src="/common.js"></script>
 <script>
@@ -38,12 +48,45 @@
   window.start = async id => await fetch('/api/start/' + id, { method: 'POST' });
   window.done  = async id => await fetch('/api/done/'  + id, { method: 'POST' });
 
+  document.getElementById('pauseBtn').onclick = async () => {
+    const minutes = prompt('How many minutes? (default 10)', '10');
+    if (minutes === null) return;
+    const reason = prompt('Reason? (optional)', 'Break') || 'Break';
+    await fetch('/api/pause', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ minutes: parseInt(minutes) || 10, reason }),
+    });
+  };
+
+  document.getElementById('resumeBtn').onclick = async () => {
+    await fetch('/api/resume', { method: 'POST' });
+  };
+
   const socket = io();
   socket.on('connect_error', () => location.href = '/login.html');
 
   socket.on('state', s => {
     document.getElementById('counterName').textContent = s.counter?.name || '—';
-    document.getElementById('totalWaiting').textContent = s.totalWaiting ?? 0;
+    document.getElementById('myQueue').textContent = s.waiting.length;
+
+    const isPaused = s.counter?.isPaused;
+    const pauseStatus = document.getElementById('pauseStatus');
+    const pauseBtn = document.getElementById('pauseBtn');
+    const resumeBtn = document.getElementById('resumeBtn');
+
+    if (isPaused) {
+      const until = new Date(s.counter.pausedUntil);
+      pauseStatus.innerHTML = `⏸ On break until <b>${until.toLocaleTimeString()}</b> (${s.counter.pauseReason || 'Break'})`;
+      pauseStatus.style.color = '#fcd34d';
+      pauseBtn.hidden = true;
+      resumeBtn.hidden = false;
+    } else {
+      pauseStatus.textContent = '🟢 Available';
+      pauseStatus.style.color = 'var(--muted)';
+      pauseBtn.hidden = false;
+      resumeBtn.hidden = true;
+    }
 
     document.getElementById('serving').innerHTML = s.serving.length === 0
       ? '<div class="empty">No customer is being served</div>'
@@ -70,7 +113,7 @@
               <div class="meta">${t.serviceType} · est wait ${fmtMinutes(t.estimatedWaitMs)}</div>
             </div>
           </div>
-          <button class="btn small" onclick="start('${t._id}')">Start service</button>
+          <button class="btn small" onclick="start('${t._id}')" ${isPaused ? 'disabled' : ''}>Start service</button>
         </div>`).join('');
   });
 })();
