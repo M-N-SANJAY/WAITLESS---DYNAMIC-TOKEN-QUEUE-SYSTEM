@@ -11,6 +11,8 @@ const CounterSchema = new mongoose.Schema({
   name: { type: String, required: true },
   serviceTypes: [String],
   isActive: { type: Boolean, default: true },
+  pausedUntil: { type: Date, default: null },
+  pauseReason: { type: String, default: null },
 });
 
 const UserSchema = new mongoose.Schema({
@@ -35,7 +37,7 @@ const TokenSchema = new mongoose.Schema({
   issuedAt: { type: Date, default: Date.now, index: true },
   startedAt: Date,
   endedAt: Date,
-  counterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Counter' },
+  counterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Counter', index: true },
   staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
 });
 
@@ -48,10 +50,20 @@ const ServiceEventSchema = new mongoose.Schema({
   endedAt: { type: Date, default: Date.now, index: true },
 });
 
+const FeedbackSchema = new mongoose.Schema({
+  tokenId: { type: mongoose.Schema.Types.ObjectId, ref: 'Token' },
+  staffId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  counterId: { type: mongoose.Schema.Types.ObjectId, ref: 'Counter' },
+  rating: { type: Number, min: 1, max: 5, required: true },
+  comment: String,
+  createdAt: { type: Date, default: Date.now, index: true },
+});
+
 module.exports = {
   connect,
   Counter: mongoose.model('Counter', CounterSchema),
   User: mongoose.model('User', UserSchema),
   Token: mongoose.model('Token', TokenSchema),
   ServiceEvent: mongoose.model('ServiceEvent', ServiceEventSchema),
+  Feedback: mongoose.model('Feedback', FeedbackSchema),
 };
